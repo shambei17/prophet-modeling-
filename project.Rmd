@@ -1,0 +1,199 @@
+---
+title: "MGF637 Project"
+output: html_notebook
+---
+Load Data
+I aim to predict the daily adjusted closing prices of SP500 index, which can be 
+easily dowloaded 
+```{r}
+SP500 <- ("^GSPC") %>%
+  tq_get(get = "stock.prices", 
+         from = "2015-01-01", 
+         to = "2020-12-18") %>% 
+  select(c('date','adjusted')) 
+
+#plot adjusted close price over time 
+SP500  %>% 
+  ggplot(aes(x = date, y = adjusted)) +
+  geom_line() +
+  labs(title = "adj_close", y = "USD", x = "date") +
+  theme_tq()
+
+#Prepare dataframe for Prophet 
+names(SP500)[1] <- 'ds'
+names(SP500)[2] <- 'y'
+
+head(SP500)
+```
+
+Prophet forecaset 
+```{r}
+library(prophet)
+library(Metrics)
+
+#Fit Prophet model 
+m <- prophet(df = SP500[0:1260, ], 
+             yearly.seasonality = val_size,
+             daily.seasonality = TRUE)
+
+# Create dataframe with the dates we want to predict 
+future <- make_future_dataframe(m, period = 42)
+
+#Eliminate weekend from future dataframe
+future <- subset(future, as.POSIXlt(future$ds)$wday >= 1 & as.POSIXlt(future$ds)$wday < 6)
+
+#predict 
+forecast <- predict(m, future)
+
+tail(forecast[c('ds','yhat','yhat_lower','yhat_upper')])
+
+#plot components
+plot(m, forecast)
+
+plot(m, forecast) + add_changepoints_to_plot(m)
+#By default changepoints to avoid overfitting fluctuations at the end of the time series
+
+#Plot components 
+prophet_plot_components(m, forecast)
+
+preds_list <- forecast %>%
+  select(c("ds", "trend")) %>%
+  mutate(ds = as.Date(ds)) 
+names(preds_list)[2] <- 'y'
+preds_list[0:1259, ] <- NA
+
+#Predictions on test set using Prophet.
+ggplot() + 
+  geom_line(data = SP500[1100:1492, ], aes(x = ds, y = y), color = "black") +
+  geom_line(data = preds_list, aes(x = ds, y = y), color = "blue") +
+  xlab('data_date') +
+  ylab('percent.change') 
+  
+
+
+```
+
+Diagnostics
+
+```{r}
+#Compute error metrics
+#split mtcars dataframe into train and test set 
+df.cv <- cross_validation(m, initial = 896, period = 252,
+                          horizon = 40, units = 'days')
+head(df.cv)
+
+cutoffs <- as.Date(c('2017-10-29','2019-11-24'))
+df.cv2 <- cross_validation(m,cutoffs = cutoffs, 
+                           horizon = val_size, units = 'days')# ignore the error, the result looks fine 
+
+df.p <- performance_metrics(df.cv)
+head(df.p)
+
+plot_cross_validation_metric(df.cv, metric = 'mape')
+
+plot_cross_validation_metric(df.cv, metric = 'rmse')
+
+plot_cross_validation_metric(df.cv, metric = 'mae')
+
+```
+
+Forecast with forecast package 
+
+```{r}
+library(quantmod)
+library(forecast)
+library(tibble)
+
+stock_price <- ("^GSPC") %>%
+  tq_get(get = "stock.prices", 
+         from = "2015-01-01", 
+         to = "2020-07-26") %>%
+  tq_transmute(select = adjusted,
+               mutate_fun = periodReturn,
+               period     = "monthly",
+               col_rename = "Rb")
+stock_price
+
+stock_price %>%
+  plot_time_series(date, Rb, .interactive = interactive)
+
+#Split Data 80/20
+splits <- initial_time_split(stock_price, prop = 0.9)
+
+#Model 1: auto arima 
+model_fit_arima_no_boost <- arima_reg() %>%
+  set_engine(engine = "auto_arima") %>%
+  fit(Rb ~ date, data = training(splits))
+
+#Model 2: boosted arima 
+model_fit_arima_boost <- arima_boost() %>%
+  set_engine(engine = "auto_arima_xgboost") %>%
+  fit(Rb ~ date, data = training(splits))
+
+#Model 3: ets 
+model_fit_ets <- exp_smoothing() %>%
+  set_engine(engine = "ets") %>%
+  fit(Rb ~ date, data = training(splits))
+
+# Model 4: lm 
+model_fit_lm <- linear_reg() %>%
+  set_engine("lm") %>%
+  fit(Rb ~ as.numeric(date) + factor(month(date, label = TRUE), ordered = FALSE),
+      data = training(splits))
+
+models_tbl <- modeltime_table(
+  model_fit_arima_no_boost,
+  model_fit_arima_boost,
+  model_fit_ets,
+  model_fit_lm
+)
+
+models_tbl
+
+#-----Calibration ----
+calibration_tbl <- models_tbl %>%
+  modeltime_calibrate(new_data = testing(splits))
+
+calibration_tbl
+
+#-----Forecast-----
+calibration_tbl %>%
+  modeltime_forecast(
+    new_data    = testing(splits),
+    actual_data = stock_price
+  ) %>%
+  plot_modeltime_forecast(
+    .legend_max_width = 25, # For mobile screens
+    .interactive      = interactive
+  )
+
+
+#------Accuracy-----
+SP500 <- ("^GSPC") %>%
+  tq_get(get = "stock.prices", 
+         from = "2015-01-01", 
+         to = "2020-12-18") %>%
+  tq_transmute(select = adjusted,
+               mutate_fun = periodReturn,
+               period     = "monthly",
+               col_rename = "Rb")
+SP500
+
+calibration_tbl %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(
+    .interactive = interactive
+  )
+
+refit_tbl <- calibration_tbl %>%
+  modeltime_refit(data = SP500)
+
+refit_tbl %>%
+  modeltime_forecast(h = "1 years", actual_data = SP500) %>%
+  plot_modeltime_forecast(
+    .legend_max_width = 25, # For mobile screens
+    .interactive      = interactive
+  )
+
+```
+
